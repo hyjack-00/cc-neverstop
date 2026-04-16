@@ -1,266 +1,233 @@
-# Claude Code 插件方案说明
+# Neverstop 设计说明
 
 ## 总目标
 
-做两个相互配合的 Claude Code 插件：
+`neverstop` 是一个单插件、双模块的 Claude Code 插件：
 
-1. **后台重试插件**
-   在某些特定的网络 / 限流 / API 失败场景下，自动启动一个后台 `-p` 重试进程。
+- `respawn`：在特定 `StopFailure` 场景下自动在后台继续工作
+- `exclusive`：只要后台 lease 仍然占用 workspace，就阻止前台继续普通对话
 
-2. **前后台互斥插件**
-   只要后台 `-p` 重试进程还在运行，就阻止前台交互式 Claude Code 继续接收普通输入，强制用户先接管后台，再继续前台工作。
+之所以不再做两个独立安装插件，是因为二者已经共享同一套：
 
-这样可以同时满足两点：
+- workspace-scoped state
+- 锁语义
+- lease 生命周期
+- 命令命名空间
 
-* 后台重试走 `claude -p`，因此不会污染 session picker。官方文档明确说明 `claude -p` 创建的 sessions 不会出现在 picker，但仍可通过 `session_id` 或名字恢复。([Claude][1])
-* 前台和后台不会同时操作同一个 session。官方文档说明多个终端同时写同一个 session 时，消息会交错，而且运行中每个终端只看到自己的消息。([Claude][1])
+拆成两个 installable plugin 会引入跨插件兼容和状态协商，复杂度高于收益。
 
----
+## 交互模型
 
-## 插件一：后台重试插件
+### 后台 lease
 
-### 目标
+插件不把“后台 Claude 进程”和“后台重试等待”当成两个不同对象，而是统一为一个 `active_lease`。
 
-当 Claude Code 因为特定类型的 API 失败结束时，自动在后台继续执行。
+只要 lease 处于以下 phase 之一，前台都视为被占用：
 
-### 使用的 hook
+- `starting`
+- `running`
+- `retry_waiting`
+- `takeover_requested`
+- `stopping`
 
-使用 `StopFailure` hook。
+这意味着：
 
-官方文档说明 `StopFailure` 会在 turn 因 API error 结束时触发，并提供：
+- 正在真正运行 `claude -p` 时前台被占用
+- 正在指数退避睡眠、等待下一次重试时前台同样被占用
 
-* `session_id`
-* `error`
-* `error_details`
-* `last_assistant_message`
+### 用户命令
 
-并且 `error` 的可选值包括：
+插件只公开两个命令：
 
-* `rate_limit`
-* `authentication_failed`
-* `billing_error`
-* `invalid_request`
-* `server_error`
-* `max_output_tokens`
-* `unknown`
+- `/neverstop:status`
+- `/neverstop:takeover`
 
-同时，`StopFailure` **没有 decision control**，只能用于通知、记录或外部编排。([Claude][2])
+这两个命令必须始终绕过互斥 block，否则会产生自锁。
 
-### 第一版建议处理的错误类型
+## Hook 约束
 
-只对以下类型自动后台重试：
+### `StopFailure`
 
-* `rate_limit`
-* `server_error`
-* `unknown`
+- 用于触发后台恢复编排
+- 只对以下错误类型自动恢复：
+  - `rate_limit`
+  - `server_error`
+  - `unknown`
+- 该 hook 不做复杂循环，只在锁内确保存在唯一 supervisor
 
-其余类型默认不自动重试，只记录状态。
+### `UserPromptSubmit`
 
-### 行为
+- 用于前后台互斥
+- 当存在活跃 lease 时：
+  - 普通 prompt 返回 `decision: "block"`
+  - `reason` 明确告诉用户去看 `/neverstop:status` 或执行 `/neverstop:takeover`
+- `/neverstop:*` 前缀必须直接放行
 
-当命中上述失败类型时：
+### `SessionStart`
 
-1. 读取当前失败的 `session_id`
-2. 检查当前是否已有后台 worker 正在运行
-3. 如果没有，则启动一个后台进程：
-
-```bash
-claude --resume <session_id> -p "continue task"
-```
-
-4. 记录后台 worker 的状态
-
-### 需要维护的状态
-
-建议维护一个简单状态文件，例如：
+- 用于注入状态提示
+- 返回：
 
 ```json
 {
-  "session_id": "...",
-  "worker_pid": 12345,
-  "status": "running"
+  "hookSpecificOutput": {
+    "hookEventName": "SessionStart",
+    "additionalContext": "..."
+  }
 }
 ```
 
-同时要有全局锁，保证**同一时刻只有一个后台 worker**。
+- 第一版只做提示，不做自动刷新，不做自动退出
 
----
-
-## 插件二：前后台互斥插件
-
-### 目标
-
-只要后台 worker 还活着，就不允许前台交互式 Claude Code 正常输入，防止前后台同时操作同一个 session。
-
-### 使用的 hook
-
-#### 1. `UserPromptSubmit`
-
-官方文档说明：
-
-* `UserPromptSubmit` 会在用户提交 prompt 时触发
-* 这个 hook 可以决定是否让这个 prompt 被继续处理
-* 还可以向上下文加入额外信息。([Claude][2])
-
-### 行为
-
-当用户在前台输入时：
-
-1. 检查是否存在活跃后台 worker
-2. 如果存在，则直接 block 当前 prompt
-3. 返回固定提示，例如：
+## 目录结构
 
 ```text
-后台任务仍在运行。请先执行 /worker:takeover
+cc-neverstop/
+  .claude-plugin/plugin.json
+  hooks/hooks.json
+  hooks/stop-failure.sh
+  hooks/user-prompt-submit.sh
+  hooks/session-start.sh
+  commands/status.md
+  commands/takeover.md
+  scripts/hook-stop-failure.mjs
+  scripts/hook-user-prompt-submit.mjs
+  scripts/hook-session-start.mjs
+  scripts/neverstop-status.mjs
+  scripts/neverstop-takeover.mjs
+  scripts/neverstop-supervisor.mjs
+  scripts/lib/state.mjs
+  scripts/lib/lock.mjs
+  scripts/lib/process.mjs
+  scripts/lib/workspace.mjs
 ```
 
-也就是说，这个插件负责实现：
+原则：
 
-* 前台和后台严格互斥
-* 只要后台没停，前台就不能继续普通对话
+- `hooks/` 只做薄入口
+- `commands/` 只做 slash-command 入口
+- `scripts/` 承担所有状态机和进程控制
+- `scripts/lib/` 放复用能力
 
-#### 2. `SessionStart`
+## 状态设计
 
-官方文档说明 `SessionStart` 可以向 Claude 注入 `additionalContext`。([Claude][2])
-
-### 行为
-
-当前台 session 启动或 resume 时：
-
-* 如果后台 worker 还在运行，就提示：
+状态目录固定为：
 
 ```text
-当前有后台任务在运行。请使用 /worker:status 或 /worker:takeover。
+${CLAUDE_PLUGIN_DATA}/state/<workspace-slug>-<workspace-hash>/
+  state.json
+  lock/
+  leases/<lease-id>.json
+  leases/<lease-id>.log
 ```
 
-这样用户一进入前台就知道当前状态。
+`state.json` 结构：
 
----
+```json
+{
+  "schema_version": 1,
+  "workspace_root": "/abs/path",
+  "active_lease": {
+    "lease_id": "neverstop-...",
+    "owner_plugin": "neverstop",
+    "session_id": "...",
+    "mode": "respawn",
+    "phase": "retry_waiting",
+    "exclusive": true,
+    "attempt": 3,
+    "started_at": "2026-04-17T00:00:00.000Z",
+    "updated_at": "2026-04-17T00:05:00.000Z",
+    "retry_deadline_at": "2026-04-17T05:00:00.000Z",
+    "next_attempt_at": "2026-04-17T00:09:00.000Z",
+    "last_error_type": "rate_limit",
+    "supervisor": {
+      "pid": 12345,
+      "start_marker": "..."
+    },
+    "child": {
+      "pid": 12378,
+      "start_marker": "..."
+    }
+  },
+  "history": []
+}
+```
 
-## 需要提供的命令
+关键点：
 
-### `/worker:status`
+- `retrying` 不是另一种任务，而是 `phase = retry_waiting`
+- exclusive 只读 lease，不猜具体后台进程在做什么
+- 状态写入必须使用临时文件 + rename
+- 锁按 workspace 作用域，而不是全局
 
-显示：
+## Supervisor 设计
 
-* 当前是否有后台 worker
-* 对应的 `session_id`
-* 对应的 `worker_pid`
+`StopFailure` 不直接无限次重新拉起 `claude -p`。它只负责创建一个 detached Node supervisor。
 
-### `/worker:takeover`
+supervisor 负责：
+
+- 持有 lease
+- 运行 `claude --resume <session_id> -p "continue task"`
+- 更新 `running` / `retry_waiting` / `completed` / `failed`
+- 按指数退避继续尝试
+- 响应 `/neverstop:takeover`
+
+为避免后台 child 自己再触发一轮新的 respawn：
+
+- child 进程环境变量里显式带上 `NEVERSTOP_SUPERVISOR_CHILD=1`
+- `StopFailure` hook 发现该变量时直接 no-op
+
+## 重试策略
+
+- 仅对 `rate_limit`、`server_error`、`unknown` 自动恢复
+- 第一次立即尝试
+- 后续间隔指数退避：
+  - `1m`
+  - `2m`
+  - `4m`
+  - `8m`
+  - `16m`
+  - 之后封顶 `30m`
+- 总自动恢复窗口固定为首次失败后 `5h`
+- 超过窗口后：
+  - phase 变为 `failed`
+  - 不再自动恢复
+  - 用户仍可查看 `/neverstop:status`
+  - 用户可执行 `/neverstop:takeover`
+
+## `/neverstop:takeover`
 
 行为：
 
-1. 如果后台 worker 存在：
-
-   * 终止它
-   * 更新状态文件为 stopped
-2. 输出一条明确提示：
+1. 给当前 lease 标记 `takeover_requested`
+2. 停掉 supervisor 及其 child 进程树
+3. 将 lease 收敛到 `stopped`
+4. 输出：
 
 ```text
-请执行：claude --resume <session_id>
+Background lease stopped.
+Resume with:
+claude --resume <session_id>
 ```
 
----
+## 明确不做的事情
 
-## 关于“刷新前台 Claude Code 界面”这件事
+第一版不做：
 
-这里要区分三件事：
+- 自动 attach 到后台进程
+- 自动刷新当前 UI
+- 自动执行 `/exit`
+- 修改 session picker
+- 修改 Claude Code 本地 session 存储
+- 兼容或迁移旧的 `cc-limit-guard` 状态
 
-### 1. 刷新当前前台界面
+## 验证
 
-我没有查到官方 hook / plugin API 可以直接“刷新当前交互界面”或让当前前台 session 自动感知后台 `-p` 的新输出。官方文档只说明：
+至少做这些验证：
 
-* `SessionStart` 可以加上下文
-* `UserPromptSubmit` 可以 block
-* `StopFailure` 只能记录/通知
-  并没有提供“刷新当前前台视图”的机制。([Claude][2])
-
-### 2. 直接让前台退出
-
-官方命令文档里有：
-
-* `/exit`
-* `/quit`
-
-它们可以退出 CLI。([Claude][3])
-
-但是我没有看到官方插件/hook API 可以**强制替用户执行 `/exit`**。
-因此，第一版设计里不要依赖“插件自动把前台退出”。
-
-### 3. 建议的交互方式
-
-第一版建议这样处理：
-
-* 插件只负责：
-
-  * 阻止前台继续输入
-  * 明确提示用户“先 takeover”
-* 用户执行 `/worker:takeover`
-* 插件停掉后台 worker 后，输出：
-
-  * 请先 `/exit`
-  * 然后重新运行：
-
-    ```bash
-    claude --resume <session_id>
-    ```
-
-也就是说：
-
-**第一版不做自动刷新，不做自动退出，只做强提示 + 强互斥。**
-
----
-
-## 不要做的事情
-
-第一版不要尝试：
-
-1. 修改 session picker 的显示规则
-2. 隐藏旧 session
-3. 删除本地 session
-4. 直接 attach 到正在运行的 `-p` 进程
-5. 让多个 worker 并发运行
-6. 修改 Claude Code 的本地 session 存储文件
-
----
-
-## 最小实现顺序
-
-### 插件一：后台重试插件
-
-1. 建状态文件和锁
-2. 实现 `StopFailure`
-3. 在指定错误类型下启动唯一后台 worker
-
-### 插件二：前后台互斥插件
-
-1. 实现 `UserPromptSubmit`，在后台 worker 存活时 block
-2. 实现 `SessionStart` 提示
-3. 实现 `/worker:status`
-4. 实现 `/worker:takeover`
-
----
-
-## 插件安装（一句话）
-
-本地测试时可直接用：
-
-```bash
-claude --plugin-dir /path/to/plugin
-```
-
-官方 CLI 参考里提供了 `--plugin-dir` 作为按目录加载插件的方式。([Claude][4])
-
----
-
-## 一句话任务描述
-
-实现两个 Claude Code 插件：
-
-* **插件一：后台重试插件**
-  监听 `StopFailure`，在 `rate_limit`、`server_error`、`unknown` 等失败类型下，为当前 `session_id` 启动唯一后台 `claude --resume <session_id> -p "continue task"` worker。
-
-* **插件二：前后台互斥插件**
-  监听 `UserPromptSubmit` 和 `SessionStart`。当后台 worker 存活时，阻止前台继续普通输入，并通过 `/worker:status` 与 `/worker:takeover` 两个命令让用户查看状态、停止后台、再手动 `/exit` + `claude --resume <session_id>` 回到前台。
-
+- `claude plugin validate <repo-root>`
+- `/neverstop:*` 命令可被调用且不会被互斥 hook 自己挡住
+- 活跃 lease 存在时普通 prompt 被 block
+- `retry_waiting` 状态也会 block 前台
+- `takeover` 能打断 `running` 和 `retry_waiting`
+- 仓库内不残留 `cc-limit-guard` / `rate-limit-guard` / `/worker:` 命名

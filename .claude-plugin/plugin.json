@@ -1,0 +1,9 @@
+{
+  "name": "neverstop",
+  "version": "0.1.0",
+  "description": "Respawn eligible Claude Code failures in the background and block foreground prompts until explicit takeover.",
+  "author": {
+    "name": "OpenAI Codex"
+  },
+  "license": "MIT"
+}
