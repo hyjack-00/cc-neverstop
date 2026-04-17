@@ -16,6 +16,73 @@ The plugin is intentionally a single installable unit because lease state, lock 
 - keep background resume attached to the same config/session namespace as the original Claude process
 - make takeover explicit and user-controlled
 
+## Session Ownership Rule
+
+`neverstop` assumes exclusive ownership of a Claude session while its lease is active.
+
+Concretely:
+
+- once the plugin has resumed `session_id` in the background, that session must be treated as occupied
+- a second terminal must not attach to the same `session_id` at the same time
+- foreground prompts for the same workspace are intentionally blocked while the lease is active
+
+This rule exists because concurrent attachment to the same Claude session produces undefined behavior from the plugin's point of view: duplicate prompt streams, interleaved context, conflicting recovery actions, and impossible-to-audit ownership.
+
+So the plugin's contract is:
+
+1. background owner runs alone
+2. foreground is blocked
+3. explicit takeover stops the background owner
+4. only then may the user manually resume the session
+
+## Runtime Sequence
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant F as Foreground Claude Session
+    participant SF as StopFailure Hook
+    participant L as Lease State
+    participant SV as neverstop Supervisor
+    participant BC as Background Claude --resume
+
+    F->>SF: StopFailure(error)
+    alt error in {rate_limit, server_error, unknown}
+        SF->>L: Acquire workspace lock and load state
+        SF->>L: Create/update active lease
+        SF->>SV: Spawn detached supervisor with inherited env
+        SV->>L: Mark phase=starting/running
+        SV->>BC: Spawn claude --resume <session_id> -p "continue task"
+        Note over BC: Background process is now the only session owner
+    else error not bound
+        SF-->>F: neverstop ignores event
+    end
+
+    U->>F: Foreground prompt
+    F->>L: UserPromptSubmit / SessionStart checks lease
+    alt active lease still alive
+        F-->>U: Block normal prompt / show status context
+    else lease stale
+        F->>L: Archive stale lease
+        F-->>U: Foreground unblocked
+    end
+
+    alt child exits with retryable failure before deadline
+        BC->>SF: Child StopFailure(error)
+        SF->>L: Update last_error_type and repair supervisor if needed
+        SV->>L: phase=retry_waiting, next_attempt_at=<backoff>
+        SV->>BC: Retry later with same env + session_id
+    else child completes or deadline expires
+        SV->>L: Archive as completed/failed/stopped
+    end
+
+    U->>F: /neverstop:takeover
+    F->>L: Resolve active lease context
+    F->>SV: Terminate supervisor/child
+    F->>L: Archive lease as stopped
+    F-->>U: Print exact manual resume command
+```
+
 ## Lease Model
 
 All background ownership is represented as a single workspace-scoped `active_lease`.
@@ -66,6 +133,7 @@ Terminal phases:
 
 - blocks normal prompts while an active lease exists
 - always allows `/neverstop:*`
+- enforces the single-owner rule so the user cannot casually continue working while the background resume path still owns the session
 
 ### `SessionStart`
 
@@ -101,6 +169,22 @@ The effective resume key is:
 
 When the window expires, the lease transitions to `failed`.
 
+## StopFailure Binding
+
+The plugin only binds a narrow subset of `StopFailure.error` values.
+
+Bound today:
+
+| StopFailure `error` | Bound | Notes |
+| --- | --- | --- |
+| `rate_limit` | `✓` | Primary intended case |
+| `server_error` | `✓` | Retryable infrastructure/server-side failure |
+| `unknown` | `✓` | Catch-all retryable bucket used by the plugin |
+
+Total bound count: `3`.
+
+Any other `StopFailure.error` value is treated as out of scope and does not start the `neverstop` background lease.
+
 ## Takeover
 
 `/neverstop:takeover`:
@@ -115,6 +199,14 @@ CLAUDE_CONFIG_DIR=<recorded-config-dir> claude --resume <session_id>
 ```
 
 All destructive operations key on `lease_id`, not `session_id`.
+
+The intended operator flow is:
+
+1. inspect with `/neverstop:status`
+2. stop ownership with `/neverstop:takeover`
+3. manually resume exactly once
+
+The plugin is not designed for "background session keeps running while I also open another terminal on the same session".
 
 ## Storage
 
@@ -149,3 +241,4 @@ The plugin does not attempt to:
 - auto-run `/exit`
 - mutate Claude’s local session store
 - support legacy migration from unrelated old plugins
+- support concurrent multi-terminal control of the same Claude session

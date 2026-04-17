@@ -46,6 +46,31 @@ Background resume is tied to the original Claude execution context:
 5. If the child fails with a retryable error, the supervisor moves the lease into `retry_waiting`.
 6. The user can inspect or stop the lease with `/neverstop:status` and `/neverstop:takeover`.
 
+## Operator sequence
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant FG as Foreground Claude
+    participant NS as neverstop
+    participant BG as Background Claude
+
+    FG->>NS: StopFailure(error)
+    NS->>BG: resume same session in background
+    Note over NS,BG: Single-owner rule starts here
+
+    U->>FG: normal prompt
+    FG-->>U: blocked while lease is active
+
+    U->>FG: /neverstop:status
+    FG-->>U: show current lease / phase / config dir
+
+    U->>FG: /neverstop:takeover
+    FG->>NS: stop background owner
+    NS-->>FG: archive lease as stopped
+    FG-->>U: print safe manual resume command
+```
+
 ## Persistence
 
 State lives under:

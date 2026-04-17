@@ -28,6 +28,26 @@ If you want to stop the background path and resume manually:
 /neverstop:takeover
 ```
 
+## Can I attach another terminal to the same session?
+
+No.
+
+If `neverstop` owns the session in the background, opening a second terminal and attaching to the same `session_id` violates the plugin's operating model.
+
+Why this matters:
+
+- the background worker may still be issuing prompts against that same session
+- your manual terminal would create a second writer for the same Claude conversation
+- lease state, retry state, and actual session ownership would diverge
+
+The safe sequence is:
+
+1. run `/neverstop:status`
+2. run `/neverstop:takeover`
+3. resume using the exact command printed by takeover
+
+Do not resume first and hope the plugin state will catch up later.
+
 ## Alternate provider profiles
 
 `neverstop` inherits the full parent environment at runtime. That allows it to keep using the same provider-specific routing variables that the original Claude process had.
