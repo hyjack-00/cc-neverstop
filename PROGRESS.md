@@ -2,44 +2,53 @@
 
 ## Current Phase
 
-Implementation complete; validating and documenting the finished single-plugin `neverstop` architecture with shared lease state, detached supervisor retrying, and exclusive foreground blocking.
+Completed implementation, review hardening, repository cleanup, and default-profile live validation capture.
 
 ## Last Updated
 
-2026-04-17 Asia/Shanghai (post-implementation validation)
+2026-04-17 Asia/Shanghai, final pass
 
 ## Active Decisions
 
-- Packaging: single plugin, two internal modules (`respawn` + `exclusive`)
+- Runtime env policy: inherit the full parent environment at runtime; do not persist secrets to disk
+- Profile routing: real quota burn tests only on the default `~/.claude` profile
+- Retry window: 6 hours
 - Commands: `/neverstop:status`, `/neverstop:takeover`
-- Runtime: Node `.mjs` helpers plus thin Bash hook wrappers
-- Retry policy: exponential backoff with a 30 minute cap and 5 hour total retry window
-- Exclusive policy: `retry_waiting` counts as occupied and blocks normal prompts
-- Legacy policy: ignore and do not depend on any `cc-limit-guard` residue
+- Packaging: single plugin, repo root remains the plugin root
+- Cross-profile visibility: commands and hooks fall back to same-workspace state buckets if `CLAUDE_CONFIG_DIR` is missing later
 
 ## Checklist
 
-- [x] Implementer: Rework the design from two installable plugins into one `neverstop` plugin with a shared lease contract.
-- [x] Evaluator: Re-read the rewritten design and confirm hook I/O, command namespace, and state contract are implementation-ready.
-- [x] Adversarial: Re-check the rewritten design for self-lock, split-brain, stale PID, and retry-window failures.
+- [x] Implementer: Capture and reuse full parent env for supervisor and child launches.
+- [x] Evaluator: Review env inheritance for correctness and secret-handling boundaries.
+- [x] Adversarial: Review env inheritance for routing mistakes, split-brain, and stale-session risks.
 
-- [x] Implementer: Create plugin scaffold (`.claude-plugin`, `hooks`, `commands`, `scripts/lib`) and wire the manifest to Claude Code conventions.
-- [x] Evaluator: Validate plugin layout against installed marketplace examples and `claude plugin validate`.
-- [x] Adversarial: Check the scaffold for namespace collisions and accidental reliance on old plugin paths.
+- [x] Implementer: Increase retry window from 5 hours to 6 hours in code and tests.
+- [x] Evaluator: Confirm retry policy is consistent across code, tests, and docs.
+- [x] Adversarial: Re-check timeout/terminal-state behavior with the new window.
 
-- [x] Implementer: Build the workspace-scoped state, lock, supervisor, and process control layers.
-- [x] Evaluator: Review state transitions and lease persistence for correctness.
-- [x] Adversarial: Challenge race handling, stale lock recovery, PID reuse checks, and takeover during backoff.
+- [x] Implementer: Add deterministic tests for config-dir extraction, env propagation, and workspace routing.
+- [x] Evaluator: Review test coverage quality and blind spots.
+- [x] Adversarial: Look for uncovered concurrency and live-rate-limit paths.
 
-- [x] Implementer: Wire `StopFailure`, `UserPromptSubmit`, `SessionStart`, `/neverstop:status`, and `/neverstop:takeover`.
-- [x] Evaluator: Verify the hooks and commands align with the documented JSON shapes and user flow.
-- [x] Adversarial: Verify `/neverstop:*` commands are not blocked by the exclusivity hook and that background retries cannot recurse.
+- [x] Implementer: Restructure README/docs/design so the repo reads like a coherent public plugin project.
+- [x] Evaluator: Review docs for clarity, installability, and architecture accuracy.
+- [x] Adversarial: Review docs for misleading guarantees or missing operational warnings.
 
-- [x] Implementer: Run validation and local smoke tests, then clean up any obvious edge-case defects.
-- [x] Evaluator: Review the final diff and test evidence.
-- [x] Adversarial: Do a final failure-mode review on the finished implementation.
+- [x] Implementer: Attempt a real default-profile rate-limit run against `/workspace/powerpoint`, capture evidence, and document the outcome.
+- [x] Evaluator: Review the validation evidence and whether it proves the retry path.
+- [x] Adversarial: Review the live-test method for hidden assumptions and false positives.
+
+## Review Notes
+
+- Fixed evaluator finding: lock heartbeat now updates `owner.json` atomically, and stale detection keys on `owner.json` mtime instead of the lock directory mtime.
+- Fixed evaluator finding: relative `CLAUDE_CONFIG_DIR` values now resolve against the workspace root before state hashing.
+- Fixed adversarial finding: commands/hooks now search same-workspace state buckets so alt-profile leases remain visible even if later invocations do not carry `CLAUDE_CONFIG_DIR`.
+- Fixed adversarial finding: `/neverstop:takeover` now prints the recorded config namespace in the manual resume command.
+- Fixed adversarial finding: `error_details` is no longer persisted to lease state, and status output no longer prints inherited env key names.
+- Fixed final review finding: cross-config fallback now recovers live lease snapshots from the corrupt bucket being scanned, not from the caller's current/default bucket.
 
 ## Open Risks
 
-- Real `StopFailure` end-to-end behavior against actual Claude API failures still needs one live Claude session pass; current validation covers scripted hook and supervisor paths.
-- Process identity checks remain strongest on Unix-like systems because `/proc` and `ps` expose richer metadata than some Windows environments.
+- A real `StopFailure(rate_limit)` was still not observed during the default-profile burn attempt; live evidence reached `allowed_warning` at 92% utilization but stopped short of an actual retry event.
+- Cross-config fallback currently assumes at most one active lease for the same workspace across all Claude profiles; simultaneous multi-profile use on one workspace would need a stronger disambiguation model.

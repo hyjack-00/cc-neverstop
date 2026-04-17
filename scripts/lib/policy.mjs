@@ -1,4 +1,9 @@
+export const RETRY_WINDOW_HOURS = 6;
 const BACKOFF_CAP_MINUTES = 30;
+
+export function computeRetryWindowMs() {
+  return RETRY_WINDOW_HOURS * 60 * 60 * 1000;
+}
 
 export function computeRetryDelayMs(attempt) {
   if (!Number.isFinite(attempt) || attempt <= 0) {

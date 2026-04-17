@@ -5,8 +5,9 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
+import { inheritParentEnv, maybeWriteEnvCapture } from "./lib/env.mjs";
 import { withWorkspaceLock } from "./lib/lock.mjs";
-import { captureProcessRef, isSameProcess } from "./lib/process.mjs";
+import { captureProcessRef } from "./lib/process.mjs";
 import { computeRetryDelayMs } from "./lib/policy.mjs";
 import { archiveActiveLease, loadState, resolveLeaseLogFile, saveState, touchLease, writeLeaseSnapshot } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -52,6 +53,22 @@ async function withLease(cwd, leaseId, mutate) {
   });
 }
 
+async function waitForChildFailureSignal(cwd, leaseId, baselineUpdatedAt, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const state = loadState(cwd);
+    const lease = state.active_lease;
+    if (!lease || lease.lease_id !== leaseId) {
+      return lease;
+    }
+    if (lease.updated_at !== baselineUpdatedAt) {
+      return lease;
+    }
+    await sleep(100);
+  }
+  return loadState(cwd).active_lease;
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   const cwd = resolveWorkspaceRoot(args.cwd || process.cwd());
@@ -74,6 +91,10 @@ async function main() {
 
   const logFile = resolveLeaseLogFile(cwd, leaseId);
   fs.appendFileSync(logFile, `[${new Date().toISOString()}] supervisor started pid=${process.pid}\n`, "utf8");
+  maybeWriteEnvCapture(
+    process.env.NEVERSTOP_TEST_CAPTURE_ENV === "1" ? process.env : null,
+    process.env.NEVERSTOP_TEST_CAPTURE_ENV_PATH || ""
+  );
 
   while (true) {
     const state = loadState(cwd);
@@ -155,17 +176,16 @@ async function main() {
     ];
     const child = spawn("claude", claudeArgs, {
       cwd,
-      env: {
-        ...process.env,
+      env: inheritParentEnv(process.env, {
         NEVERSTOP_SUPERVISOR_CHILD: "1",
         NEVERSTOP_ACTIVE_LEASE_ID: leaseId
-      },
+      }),
       detached: false,
       stdio: "ignore",
       windowsHide: true
     });
 
-    await withLease(cwd, leaseId, (currentLease) =>
+    const childLease = await withLease(cwd, leaseId, (currentLease) =>
       touchLease(currentLease, {
         phase: "running",
         child: {
@@ -173,14 +193,19 @@ async function main() {
         }
       })
     );
+    if (!childLease) {
+      return;
+    }
 
     const exitCode = await new Promise((resolve, reject) => {
       child.on("error", reject);
       child.on("exit", (code) => resolve(code ?? 1));
     });
 
-    const finishedState = loadState(cwd);
-    const finishedLease = finishedState.active_lease;
+    const finishedLease =
+      exitCode === 0
+        ? loadState(cwd).active_lease
+        : await waitForChildFailureSignal(cwd, leaseId, childLease.updated_at);
     if (!finishedLease || finishedLease.lease_id !== leaseId) {
       return;
     }
@@ -228,10 +253,6 @@ async function main() {
         next_attempt_at: retryAt
       })
     );
-
-    if (!isSameProcess({ pid: process.pid, start_marker: getProcessStartMarker(process.pid) })) {
-      return;
-    }
   }
 }
 

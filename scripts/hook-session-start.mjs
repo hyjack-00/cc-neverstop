@@ -5,7 +5,7 @@ import process from "node:process";
 
 import { leaseHasLiveProcesses } from "./lib/process.mjs";
 import { withWorkspaceLock } from "./lib/lock.mjs";
-import { archiveActiveLease, loadState } from "./lib/state.mjs";
+import { archiveActiveLease, findActiveLeaseContext, loadState } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 function readInput() {
@@ -26,8 +26,10 @@ function buildMessage(lease) {
 
 async function main() {
   const input = readInput();
-  const cwd = resolveWorkspaceRoot(input.cwd || process.cwd());
-  const state = loadState(cwd);
+  const cwd = resolveWorkspaceRoot(input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd());
+  const context = findActiveLeaseContext(cwd);
+  const configDir = context?.config_dir ?? null;
+  const state = context?.state ?? loadState(cwd);
   const lease = state.active_lease;
   if (!lease) {
     return;
@@ -35,11 +37,11 @@ async function main() {
 
   if (!leaseHasLiveProcesses(lease)) {
     await withWorkspaceLock(cwd, async () => {
-      const nextState = loadState(cwd);
+      const nextState = loadState(cwd, configDir);
       if (nextState.active_lease?.lease_id === lease.lease_id && !leaseHasLiveProcesses(nextState.active_lease)) {
-        archiveActiveLease(cwd, lease.phase === "failed" ? "failed" : "stopped");
+        archiveActiveLease(cwd, lease.phase === "failed" ? "failed" : "stopped", configDir);
       }
-    });
+    }, { configDir });
     return;
   }
 

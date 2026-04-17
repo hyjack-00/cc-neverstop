@@ -3,10 +3,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { resolveConfigDir } from "./env.mjs";
 import { leaseHasLiveProcesses } from "./process.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
-export const STATE_VERSION = 1;
+export const STATE_VERSION = 2;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 const FALLBACK_ROOT = path.join(os.tmpdir(), "neverstop");
 const HISTORY_LIMIT = 20;
@@ -24,39 +25,52 @@ function defaultState(workspaceRoot) {
   };
 }
 
-export function resolveStateDir(cwd) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
+function stateRoot() {
+  return process.env[PLUGIN_DATA_ENV] ? path.join(process.env[PLUGIN_DATA_ENV], "state") : FALLBACK_ROOT;
+}
+
+function resolveStateDirFor(workspaceRoot, configDir) {
   const slugBase = path.basename(workspaceRoot) || "workspace";
   const slug = slugBase.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
-  const hash = createHash("sha256").update(workspaceRoot).digest("hex").slice(0, 16);
-  const root = process.env[PLUGIN_DATA_ENV] ? path.join(process.env[PLUGIN_DATA_ENV], "state") : FALLBACK_ROOT;
-  return path.join(root, `${slug}-${hash}`);
+  const configSlugBase = path.basename(configDir) || "config";
+  const configSlug = configSlugBase.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "config";
+  const hash = createHash("sha256").update(`${workspaceRoot}\u0000${configDir}`).digest("hex").slice(0, 16);
+  return path.join(stateRoot(), `${slug}-${configSlug}-${hash}`);
 }
 
-export function resolveStateFile(cwd) {
-  return path.join(resolveStateDir(cwd), "state.json");
+export function resolveStateDir(cwd, configDir = null) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  return resolveStateDirFor(workspaceRoot, configDir ?? resolveConfigDir(process.env, workspaceRoot));
 }
 
-export function resolveLeasesDir(cwd) {
-  return path.join(resolveStateDir(cwd), "leases");
+function resolveStateFileFor(workspaceRoot, configDir) {
+  return path.join(resolveStateDirFor(workspaceRoot, configDir), "state.json");
 }
 
-export function resolveLockDir(cwd) {
-  return path.join(resolveStateDir(cwd), "lock");
+export function resolveStateFile(cwd, configDir = null) {
+  return path.join(resolveStateDir(cwd, configDir), "state.json");
 }
 
-export function ensureStateDir(cwd) {
-  fs.mkdirSync(resolveLeasesDir(cwd), { recursive: true });
+export function resolveLeasesDir(cwd, configDir = null) {
+  return path.join(resolveStateDir(cwd, configDir), "leases");
 }
 
-export function resolveLeaseFile(cwd, leaseId) {
-  ensureStateDir(cwd);
-  return path.join(resolveLeasesDir(cwd), `${leaseId}.json`);
+export function resolveLockDir(cwd, configDir = null) {
+  return path.join(resolveStateDir(cwd, configDir), "lock");
 }
 
-export function resolveLeaseLogFile(cwd, leaseId) {
-  ensureStateDir(cwd);
-  return path.join(resolveLeasesDir(cwd), `${leaseId}.log`);
+export function ensureStateDir(cwd, configDir = null) {
+  fs.mkdirSync(resolveLeasesDir(cwd, configDir), { recursive: true });
+}
+
+export function resolveLeaseFile(cwd, leaseId, configDir = null) {
+  ensureStateDir(cwd, configDir);
+  return path.join(resolveLeasesDir(cwd, configDir), `${leaseId}.json`);
+}
+
+export function resolveLeaseLogFile(cwd, leaseId, configDir = null) {
+  ensureStateDir(cwd, configDir);
+  return path.join(resolveLeasesDir(cwd, configDir), `${leaseId}.log`);
 }
 
 function fsyncFile(filePath) {
@@ -77,9 +91,7 @@ export function atomicWriteJson(filePath, payload) {
   fs.renameSync(tmpFile, filePath);
 }
 
-export function loadState(cwd) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const stateFile = resolveStateFile(workspaceRoot);
+function readStateFile(stateFile, workspaceRoot) {
   if (!fs.existsSync(stateFile)) {
     return defaultState(workspaceRoot);
   }
@@ -90,11 +102,11 @@ export function loadState(cwd) {
       ...defaultState(workspaceRoot),
       ...parsed,
       schema_version: STATE_VERSION,
-      workspace_root: workspaceRoot,
+      workspace_root: parsed.workspace_root ?? workspaceRoot,
       history: Array.isArray(parsed.history) ? parsed.history : []
     };
   } catch {
-    const recoveredLease = recoverLeaseFromSnapshots(workspaceRoot);
+    const recoveredLease = recoverLeaseFromSnapshots(path.join(path.dirname(stateFile), "leases"));
     return {
       ...defaultState(workspaceRoot),
       active_lease: recoveredLease,
@@ -103,8 +115,13 @@ export function loadState(cwd) {
   }
 }
 
-function recoverLeaseFromSnapshots(cwd) {
-  const leasesDir = resolveLeasesDir(cwd);
+export function loadState(cwd, configDir = null) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const resolvedConfigDir = configDir ?? resolveConfigDir(process.env, workspaceRoot);
+  return readStateFile(resolveStateFileFor(workspaceRoot, resolvedConfigDir), workspaceRoot);
+}
+
+function recoverLeaseFromSnapshots(leasesDir) {
   if (!fs.existsSync(leasesDir)) {
     return null;
   }
@@ -133,23 +150,24 @@ function recoverLeaseFromSnapshots(cwd) {
   return null;
 }
 
-export function saveState(cwd, state) {
+export function saveState(cwd, state, configDir = null) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  ensureStateDir(workspaceRoot);
+  const resolvedConfigDir = configDir ?? resolveConfigDir(process.env, workspaceRoot);
+  ensureStateDir(workspaceRoot, resolvedConfigDir);
   const nextState = {
     schema_version: STATE_VERSION,
     workspace_root: workspaceRoot,
     active_lease: state.active_lease ?? null,
     history: Array.isArray(state.history) ? state.history.slice(0, HISTORY_LIMIT) : []
   };
-  atomicWriteJson(resolveStateFile(workspaceRoot), nextState);
+  atomicWriteJson(resolveStateFileFor(workspaceRoot, resolvedConfigDir), nextState);
   return nextState;
 }
 
-export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
+export function updateState(cwd, mutate, configDir = null) {
+  const state = loadState(cwd, configDir);
   mutate(state);
-  return saveState(cwd, state);
+  return saveState(cwd, state, configDir);
 }
 
 export function newLease({ sessionId, errorType, deadlineAt }) {
@@ -167,13 +185,15 @@ export function newLease({ sessionId, errorType, deadlineAt }) {
     retry_deadline_at: deadlineAt,
     next_attempt_at: now,
     last_error_type: errorType,
+    config_dir: null,
+    env_summary: null,
     supervisor: null,
     child: null
   };
 }
 
-export function writeLeaseSnapshot(cwd, lease) {
-  atomicWriteJson(resolveLeaseFile(cwd, lease.lease_id), lease);
+export function writeLeaseSnapshot(cwd, lease, configDir = null) {
+  atomicWriteJson(resolveLeaseFile(cwd, lease.lease_id, configDir), lease);
 }
 
 export function summarizeLease(lease, statusOverride) {
@@ -185,6 +205,7 @@ export function summarizeLease(lease, statusOverride) {
     session_id: lease.session_id,
     phase: statusOverride ?? lease.phase,
     attempt: lease.attempt,
+    config_dir: lease.config_dir ?? null,
     started_at: lease.started_at,
     updated_at: lease.updated_at,
     retry_deadline_at: lease.retry_deadline_at,
@@ -193,7 +214,7 @@ export function summarizeLease(lease, statusOverride) {
   };
 }
 
-export function archiveActiveLease(cwd, finalPhase) {
+export function archiveActiveLease(cwd, finalPhase, configDir = null) {
   return updateState(cwd, (state) => {
     if (!state.active_lease) {
       return;
@@ -204,7 +225,7 @@ export function archiveActiveLease(cwd, finalPhase) {
     };
     state.history.unshift(archived);
     state.active_lease = null;
-  });
+  }, configDir);
 }
 
 export function touchLease(lease, patch = {}) {
@@ -213,4 +234,73 @@ export function touchLease(lease, patch = {}) {
     ...patch,
     updated_at: nowIso()
   };
+}
+
+function candidateContexts(cwd) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const currentConfigDir = resolveConfigDir(process.env, workspaceRoot);
+  const contexts = [
+    {
+      workspace_root: workspaceRoot,
+      config_dir: currentConfigDir,
+      state: loadState(workspaceRoot, currentConfigDir)
+    }
+  ];
+
+  if (!fs.existsSync(stateRoot())) {
+    return contexts;
+  }
+
+  for (const entry of fs.readdirSync(stateRoot(), { withFileTypes: true })) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const stateFile = path.join(stateRoot(), entry.name, "state.json");
+    if (!fs.existsSync(stateFile)) {
+      continue;
+    }
+    try {
+      const state = readStateFile(stateFile, workspaceRoot);
+      if (state.workspace_root !== workspaceRoot) {
+        continue;
+      }
+      const configDir = state.active_lease?.config_dir || null;
+      if (configDir === currentConfigDir) {
+        continue;
+      }
+      contexts.push({
+        workspace_root: workspaceRoot,
+        config_dir: configDir,
+        state
+      });
+    } catch {
+      // Ignore unreadable state buckets.
+    }
+  }
+
+  return contexts;
+}
+
+export function findActiveLeaseContext(cwd, options = {}) {
+  const leaseId = options.leaseId ?? null;
+  const includeHistory = options.includeHistory ?? false;
+  const contexts = candidateContexts(cwd)
+    .filter((context) => {
+      if (leaseId) {
+        return context.state.active_lease?.lease_id === leaseId;
+      }
+      return Boolean(context.state.active_lease) || (includeHistory && Boolean(context.state.history[0]));
+    })
+    .sort((left, right) => {
+      const leftLive = leaseHasLiveProcesses(left.state.active_lease) ? 1 : 0;
+      const rightLive = leaseHasLiveProcesses(right.state.active_lease) ? 1 : 0;
+      if (leftLive !== rightLive) {
+        return rightLive - leftLive;
+      }
+      const leftUpdated = Date.parse(left.state.active_lease?.updated_at || left.state.history[0]?.archived_at || 0);
+      const rightUpdated = Date.parse(right.state.active_lease?.updated_at || right.state.history[0]?.archived_at || 0);
+      return rightUpdated - leftUpdated;
+    });
+
+  return contexts[0] ?? null;
 }

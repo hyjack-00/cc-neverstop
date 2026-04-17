@@ -4,7 +4,7 @@ import process from "node:process";
 
 import { withWorkspaceLock } from "./lib/lock.mjs";
 import { isSameProcess, terminateProcessTree } from "./lib/process.mjs";
-import { archiveActiveLease, loadState, saveState, touchLease } from "./lib/state.mjs";
+import { archiveActiveLease, findActiveLeaseContext, loadState, saveState, touchLease } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 function sleep(ms) {
@@ -12,25 +12,31 @@ function sleep(ms) {
 }
 
 async function main() {
-  const cwd = resolveWorkspaceRoot(process.cwd());
+  const cwd = resolveWorkspaceRoot(process.env.CLAUDE_PROJECT_DIR || process.cwd());
+  const context = findActiveLeaseContext(cwd);
+  const configDir = context?.config_dir ?? null;
   let sessionId = null;
+  let leaseId = null;
   let supervisor = null;
   let child = null;
+  let resumeConfigDir = null;
 
   await withWorkspaceLock(cwd, async () => {
-    const state = loadState(cwd);
+    const state = loadState(cwd, configDir);
     const lease = state.active_lease;
     if (!lease) {
       return;
     }
 
     sessionId = lease.session_id;
+    leaseId = lease.lease_id;
     supervisor = lease.supervisor;
     child = lease.child;
+    resumeConfigDir = lease.config_dir || configDir;
     state.active_lease = touchLease(lease, {
       phase: "takeover_requested"
     });
-    saveState(cwd, state);
+    saveState(cwd, state, configDir);
 
     if (isSameProcess(supervisor)) {
       terminateProcessTree(supervisor.pid, "SIGTERM");
@@ -38,7 +44,7 @@ async function main() {
     if (isSameProcess(child)) {
       terminateProcessTree(child.pid, "SIGTERM");
     }
-  });
+  }, { configDir });
 
   const gracefulDeadline = Date.now() + 5000;
   while (Date.now() < gracefulDeadline) {
@@ -69,18 +75,19 @@ async function main() {
   }
 
   await withWorkspaceLock(cwd, async () => {
-    const state = loadState(cwd);
-    if (state.active_lease?.session_id === sessionId) {
-      archiveActiveLease(cwd, "stopped");
+    const state = loadState(cwd, configDir);
+    if (state.active_lease?.lease_id === leaseId) {
+      archiveActiveLease(cwd, "stopped", configDir);
     }
-  });
+  }, { configDir });
 
   if (!sessionId) {
     process.stdout.write("Neverstop status: idle\n");
     return;
   }
 
-  process.stdout.write(`Background lease stopped.\nResume with:\nclaude --resume ${sessionId}\n`);
+  const resumePrefix = resumeConfigDir ? `CLAUDE_CONFIG_DIR=${JSON.stringify(resumeConfigDir)} ` : "";
+  process.stdout.write(`Background lease stopped.\nResume with:\n${resumePrefix}claude --resume ${sessionId}\n`);
 }
 
 main().catch((error) => {

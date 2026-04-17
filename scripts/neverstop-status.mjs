@@ -4,7 +4,7 @@ import process from "node:process";
 
 import { leaseHasLiveProcesses } from "./lib/process.mjs";
 import { withWorkspaceLock } from "./lib/lock.mjs";
-import { archiveActiveLease, loadState, resolveLeaseLogFile } from "./lib/state.mjs";
+import { archiveActiveLease, findActiveLeaseContext, loadState, resolveLeaseLogFile } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 function line(label, value) {
@@ -29,8 +29,10 @@ function printArchived(archived) {
 }
 
 async function main() {
-  const cwd = resolveWorkspaceRoot(process.cwd());
-  const state = loadState(cwd);
+  const cwd = resolveWorkspaceRoot(process.env.CLAUDE_PROJECT_DIR || process.cwd());
+  const context = findActiveLeaseContext(cwd, { includeHistory: true });
+  const state = context?.state ?? loadState(cwd);
+  const configDir = context?.config_dir ?? null;
   const lease = state.active_lease;
 
   if (!lease) {
@@ -44,12 +46,12 @@ async function main() {
 
   if (!leaseHasLiveProcesses(lease)) {
     await withWorkspaceLock(cwd, async () => {
-      const nextState = loadState(cwd);
+      const nextState = loadState(cwd, configDir);
       if (nextState.active_lease?.lease_id === lease.lease_id && !leaseHasLiveProcesses(nextState.active_lease)) {
-        archiveActiveLease(cwd, lease.phase === "failed" ? "failed" : "stopped");
+        archiveActiveLease(cwd, lease.phase === "failed" ? "failed" : "stopped", configDir);
       }
-    });
-    const nextState = loadState(cwd);
+    }, { configDir });
+    const nextState = loadState(cwd, configDir);
     if (nextState.history[0]) {
       printArchived(nextState.history[0]);
       return;
@@ -65,13 +67,14 @@ async function main() {
     line("Phase", lease.phase),
     line("Attempt", String(lease.attempt)),
     line("Error", String(lease.last_error_type || "")),
+    line("Config Dir", String(lease.config_dir || "-")),
     line("Started", lease.started_at),
     line("Updated", lease.updated_at),
     line("Deadline", lease.retry_deadline_at),
     line("Next Attempt", lease.next_attempt_at || "-"),
     line("Supervisor PID", String(lease.supervisor?.pid ?? "-")),
     line("Child PID", String(lease.child?.pid ?? "-")),
-    line("Log File", resolveLeaseLogFile(cwd, lease.lease_id))
+    line("Log File", resolveLeaseLogFile(cwd, lease.lease_id, lease.config_dir || configDir))
   ];
 
   if (lease.phase === "retry_waiting") {

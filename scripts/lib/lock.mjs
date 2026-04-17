@@ -8,28 +8,36 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function lockAgeMs(lockDir) {
+function ownerAgeMs(ownerFile) {
   try {
-    const stat = fs.statSync(lockDir);
+    const stat = fs.statSync(ownerFile);
     return Date.now() - stat.mtimeMs;
   } catch {
     return 0;
   }
 }
 
+function writeOwnerFile(ownerFile) {
+  const payload = captureProcessRef(process.pid) ?? { pid: process.pid };
+  const tempFile = `${ownerFile}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tempFile, `${JSON.stringify(payload)}\n`, "utf8");
+  fs.renameSync(tempFile, ownerFile);
+}
+
 export async function withWorkspaceLock(cwd, fn, options = {}) {
-  const lockDir = resolveLockDir(cwd);
+  const lockDir = resolveLockDir(cwd, options.configDir);
   fs.mkdirSync(path.dirname(lockDir), { recursive: true });
   const ownerFile = path.join(lockDir, "owner.json");
   const staleMs = options.staleMs ?? 30000;
   const retryMs = options.retryMs ?? 100;
   const timeoutMs = options.timeoutMs ?? 5000;
+  const heartbeatMs = options.heartbeatMs ?? Math.max(1000, Math.floor(staleMs / 3));
   const deadline = Date.now() + timeoutMs;
 
   while (true) {
     try {
       fs.mkdirSync(lockDir, { recursive: false });
-      fs.writeFileSync(ownerFile, `${JSON.stringify(captureProcessRef(process.pid) ?? { pid: process.pid })}\n`, "utf8");
+      writeOwnerFile(ownerFile);
       break;
     } catch (error) {
       if (error.code !== "EEXIST") {
@@ -41,7 +49,7 @@ export async function withWorkspaceLock(cwd, fn, options = {}) {
       } catch {
         owner = null;
       }
-      if (lockAgeMs(lockDir) > staleMs && (!owner || !isSameProcess(owner))) {
+      if (ownerAgeMs(ownerFile) > staleMs && (!owner || !isSameProcess(owner))) {
         fs.rmSync(lockDir, { recursive: true, force: true });
         continue;
       }
@@ -52,9 +60,20 @@ export async function withWorkspaceLock(cwd, fn, options = {}) {
     }
   }
 
+  let heartbeat = null;
   try {
+    heartbeat = setInterval(() => {
+      try {
+        writeOwnerFile(ownerFile);
+      } catch {
+        // Best effort heartbeat only.
+      }
+    }, heartbeatMs);
     return await fn();
   } finally {
+    if (heartbeat) {
+      clearInterval(heartbeat);
+    }
     fs.rmSync(lockDir, { recursive: true, force: true });
   }
 }
