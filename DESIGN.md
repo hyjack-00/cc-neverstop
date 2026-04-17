@@ -35,53 +35,7 @@ So the plugin's contract is:
 3. explicit takeover stops the background owner
 4. only then may the user manually resume the session
 
-## Runtime Sequence
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant F as Foreground Claude Session
-    participant SF as StopFailure Hook
-    participant L as Lease State
-    participant SV as neverstop Supervisor
-    participant BC as Background Claude --resume
-
-    F->>SF: StopFailure(error)
-    alt error in {rate_limit, server_error, unknown}
-        SF->>L: Acquire workspace lock and load state
-        SF->>L: Create/update active lease
-        SF->>SV: Spawn detached supervisor with inherited env
-        SV->>L: Mark phase=starting/running
-        SV->>BC: Spawn claude --resume <session_id> -p "continue task"
-        Note over BC: Background process is now the only session owner
-    else error not bound
-        SF-->>F: neverstop ignores event
-    end
-
-    U->>F: Foreground prompt
-    F->>L: UserPromptSubmit / SessionStart checks lease
-    alt active lease still alive
-        F-->>U: Block normal prompt / show status context
-    else lease stale
-        F->>L: Archive stale lease
-        F-->>U: Foreground unblocked
-    end
-
-    alt child exits with retryable failure before deadline
-        BC->>SF: Child StopFailure(error)
-        SF->>L: Update last_error_type and repair supervisor if needed
-        SV->>L: phase=retry_waiting, next_attempt_at=<backoff>
-        SV->>BC: Retry later with same env + session_id
-    else child completes or deadline expires
-        SV->>L: Archive as completed/failed/stopped
-    end
-
-    U->>F: /neverstop:takeover
-    F->>L: Resolve active lease context
-    F->>SV: Terminate supervisor/child
-    F->>L: Archive lease as stopped
-    F-->>U: Print exact manual resume command
-```
+See [docs/architecture.md](./docs/architecture.md) for the detailed runtime sequence. The README keeps a simplified operator-facing diagram on purpose.
 
 ## Lease Model
 
@@ -178,12 +132,16 @@ Bound today:
 | StopFailure `error` | Bound | Notes |
 | --- | --- | --- |
 | `rate_limit` | `✓` | Primary intended case |
+| `authentication_failed` | `✗` | Explicitly out of scope |
+| `billing_error` | `✗` | Explicitly out of scope |
+| `invalid_request` | `✗` | Explicitly out of scope |
 | `server_error` | `✓` | Retryable infrastructure/server-side failure |
+| `max_output_tokens` | `✗` | Explicitly out of scope |
 | `unknown` | `✓` | Catch-all retryable bucket used by the plugin |
 
-Total bound count: `3`.
+Total bound count: `3 / 7`.
 
-Any other `StopFailure.error` value is treated as out of scope and does not start the `neverstop` background lease.
+The full `StopFailure.error` enum comes from the Claude Code hooks reference. `neverstop` only starts a background lease for the three checked rows above.
 
 ## Takeover
 

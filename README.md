@@ -61,43 +61,34 @@ This behavior is deliberate. The plugin is not passive observability; it is acti
 
 ## Sequence Diagram
 
-The main operator flow looks like this:
+The user-facing relationship is intentionally simple:
 
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant F as Foreground Claude
-    participant H as neverstop StopFailure Hook
-    participant S as neverstop Supervisor
-    participant B as Background Claude --resume
+    participant FG as Foreground Claude Terminal
+    participant BG as neverstop Background Owner
 
-    F->>H: StopFailure(error=rate_limit/server_error/unknown)
-    H->>S: Create or reuse active lease
-    S->>B: claude --resume <session_id> -p "continue task"
-    Note over S,B: Background now owns the session
+    Note over FG,BG: Retryable StopFailure occurs
+    BG->>BG: Resume the same session in background
+    Note over BG: Background becomes the only owner
 
-    U->>F: Normal foreground prompt
-    F-->>U: Blocked by neverstop
-    Note over U,F: User must not attach another terminal to the same session
+    U->>FG: Normal prompt / manual resume attempt
+    FG-->>U: Blocked while background lease is active
 
-    alt Background succeeds
-        B-->>S: Session continues or completes
-        S-->>F: Lease clears
-        U->>F: Foreground can continue normally
-    else Background waits to retry
-        B-->>S: Retryable failure
-        S-->>S: Enter retry_waiting with backoff
-        U->>F: /neverstop:status
-        F-->>U: Show active lease, phase, config dir, log path
-        U->>F: /neverstop:takeover
-        F->>S: Stop background owner
-        S-->>F: Lease archived as stopped
-        F-->>U: Print exact manual resume command
-        U->>F: Resume once in the foreground
-    end
+    U->>FG: /neverstop:status
+    FG-->>U: Show whether background still owns the session
+
+    U->>FG: /neverstop:takeover
+    FG->>BG: Stop background owner
+    BG-->>FG: Lease cleared
+    FG-->>U: Print safe resume command
+
+    U->>FG: Resume once in foreground
+    Note over U,FG: No second terminal should attach before takeover
 ```
 
-The key rule is unchanged throughout the diagram: while the background lease is active, there is exactly one owner of the session, and it is not the foreground terminal.
+While the background lease is active, the foreground terminal is not the owner of the session.
 
 ## Install
 
@@ -138,12 +129,16 @@ Current coverage:
 | StopFailure `error` | Handled by `neverstop` | Behavior |
 | --- | --- | --- |
 | `rate_limit` | `✓` | Start or continue background retry flow |
+| `authentication_failed` | `✗` | Ignored by `neverstop` |
+| `billing_error` | `✗` | Ignored by `neverstop` |
+| `invalid_request` | `✗` | Ignored by `neverstop` |
 | `server_error` | `✓` | Start or continue background retry flow |
+| `max_output_tokens` | `✗` | Ignored by `neverstop` |
 | `unknown` | `✓` | Start or continue background retry flow |
 
-So the current bound count is `3`.
+So the current bound count is `3 / 7`.
 
-If Claude Code surfaces any other `StopFailure.error` value, `neverstop` currently ignores it and does not claim background ownership for that failure.
+These names come from the Claude Code hooks reference for `StopFailure.error`.
 
 ## Environment Inheritance
 

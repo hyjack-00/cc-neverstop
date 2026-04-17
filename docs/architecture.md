@@ -51,24 +51,47 @@ Background resume is tied to the original Claude execution context:
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant FG as Foreground Claude
-    participant NS as neverstop
-    participant BG as Background Claude
+    participant F as Foreground Claude Session
+    participant SF as StopFailure Hook
+    participant L as Lease State
+    participant SV as neverstop Supervisor
+    participant BC as Background Claude --resume
 
-    FG->>NS: StopFailure(error)
-    NS->>BG: resume same session in background
-    Note over NS,BG: Single-owner rule starts here
+    F->>SF: StopFailure(error)
+    alt error in {rate_limit, server_error, unknown}
+        SF->>L: Acquire workspace lock and load state
+        SF->>L: Create/update active lease
+        SF->>SV: Spawn detached supervisor with inherited env
+        SV->>L: Mark phase=starting/running
+        SV->>BC: Spawn claude --resume <session_id> -p "continue task"
+        Note over BC: Background process is now the only session owner
+    else error in {authentication_failed, billing_error, invalid_request, max_output_tokens}
+        SF-->>F: neverstop ignores event
+    end
 
-    U->>FG: normal prompt
-    FG-->>U: blocked while lease is active
+    U->>F: Foreground prompt
+    F->>L: UserPromptSubmit / SessionStart checks lease
+    alt active lease still alive
+        F-->>U: Block normal prompt / show status context
+    else lease stale
+        F->>L: Archive stale lease
+        F-->>U: Foreground unblocked
+    end
 
-    U->>FG: /neverstop:status
-    FG-->>U: show current lease / phase / config dir
+    alt child exits with retryable failure before deadline
+        BC->>SF: Child StopFailure(error)
+        SF->>L: Update last_error_type and repair supervisor if needed
+        SV->>L: phase=retry_waiting, next_attempt_at=<backoff>
+        SV->>BC: Retry later with same env + session_id
+    else child completes or deadline expires
+        SV->>L: Archive as completed/failed/stopped
+    end
 
-    U->>FG: /neverstop:takeover
-    FG->>NS: stop background owner
-    NS-->>FG: archive lease as stopped
-    FG-->>U: print safe manual resume command
+    U->>F: /neverstop:takeover
+    F->>L: Resolve active lease context
+    F->>SV: Terminate supervisor/child
+    F->>L: Archive lease as stopped
+    F-->>U: Print exact manual resume command
 ```
 
 ## Persistence
