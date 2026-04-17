@@ -49,6 +49,57 @@ test("relative CLAUDE_CONFIG_DIR resolves against the workspace root", () => {
   assert.equal(resolveConfigDir({ CLAUDE_CONFIG_DIR: ".claude-alt" }, REPO_ROOT), path.join(REPO_ROOT, ".claude-alt"));
 });
 
+test("billing_error is treated as retryable by stop failure", async () => {
+  await withTempPluginData(async (pluginData) => {
+    const hook = spawnSync("node", ["scripts/hook-stop-failure.mjs"], {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        CLAUDE_PLUGIN_ROOT: REPO_ROOT,
+        CLAUDE_PLUGIN_DATA: pluginData,
+        CLAUDE_CONFIG_DIR: "/tmp/claude-alt-profile"
+      },
+      input: JSON.stringify({
+        cwd: REPO_ROOT,
+        session_id: "sess-billing",
+        error: "billing_error"
+      }),
+      encoding: "utf8"
+    });
+    assert.equal(hook.status, 0);
+    assert.match(hook.stderr, /claimed StopFailure\(error=billing_error\)/);
+    assert.match(hook.stderr, /retry prompt source:/);
+    assert.match(hook.stderr, /retry prompt will execute: "continue task"/);
+
+    const stateResult = spawnSync("node", ["-e", 'import("./scripts/lib/state.mjs").then(m=>{const s=m.loadState(process.cwd()); console.log(JSON.stringify({leaseId:s.active_lease?.lease_id || null,error:s.active_lease?.last_error_type || null,phase:s.active_lease?.phase || null}));})'], {
+      cwd: REPO_ROOT,
+      env: { ...process.env, CLAUDE_PLUGIN_DATA: pluginData, CLAUDE_CONFIG_DIR: "/tmp/claude-alt-profile" },
+      encoding: "utf8"
+    });
+
+    assert.equal(stateResult.status, 0);
+    assert.match(stateResult.stdout, /"error":"billing_error"/);
+    assert.match(stateResult.stdout, /"phase":"(starting|running)"/);
+
+    const takeover = spawnSync("node", ["scripts/neverstop-takeover.mjs"], {
+      cwd: REPO_ROOT,
+      env: { ...process.env, CLAUDE_PLUGIN_DATA: pluginData, CLAUDE_CONFIG_DIR: "/tmp/claude-alt-profile" },
+      encoding: "utf8"
+    });
+    assert.equal(takeover.status, 0);
+  });
+});
+
+test("retry prompt loads from prompts/retry-prompt.txt", async () => {
+  const result = spawnSync("node", ["-e", 'import("./scripts/lib/retry-prompt.mjs").then(m=>console.log(JSON.stringify({path:m.resolveRetryPromptPath(process.cwd()),prompt:m.loadRetryPrompt(process.cwd())})))'], {
+    cwd: REPO_ROOT,
+    encoding: "utf8"
+  });
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /"path":".*prompts\/retry-prompt\.txt"/);
+  assert.match(result.stdout, /"prompt":"continue task"/);
+});
+
 test("corrupt state recovers active lease from a live lease snapshot", async () => {
   await withTempPluginData(async (pluginData) => {
     const sleeper = spawnSync("bash", ["-lc", "sleep 3 >/dev/null 2>&1 & echo $!"], {

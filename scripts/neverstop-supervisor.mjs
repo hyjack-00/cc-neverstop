@@ -9,10 +9,11 @@ import { inheritParentEnv, maybeWriteEnvCapture } from "./lib/env.mjs";
 import { withWorkspaceLock } from "./lib/lock.mjs";
 import { captureProcessRef } from "./lib/process.mjs";
 import { computeRetryDelayMs } from "./lib/policy.mjs";
+import { loadRetryPrompt } from "./lib/retry-prompt.mjs";
 import { archiveActiveLease, loadState, resolveLeaseLogFile, saveState, touchLease, writeLeaseSnapshot } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
-const RETRYABLE_ERRORS = new Set(["rate_limit", "server_error", "unknown"]);
+const RETRYABLE_ERRORS = new Set(["rate_limit", "billing_error", "server_error", "unknown"]);
 
 function parseArgs(argv) {
   const args = {};
@@ -74,6 +75,7 @@ async function main() {
   const cwd = resolveWorkspaceRoot(args.cwd || process.cwd());
   const leaseId = args["lease-id"];
   const root = pluginRoot();
+  const retryPrompt = loadRetryPrompt(root);
 
   if (!leaseId) {
     throw new Error("Missing --lease-id");
@@ -172,7 +174,7 @@ async function main() {
       "--resume",
       startedLease.session_id,
       "-p",
-      "continue task"
+      retryPrompt
     ];
     const child = spawn("claude", claudeArgs, {
       cwd,

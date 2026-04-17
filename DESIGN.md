@@ -78,7 +78,7 @@ Terminal phases:
 
 ### `StopFailure`
 
-- handles `rate_limit`, `server_error`, and `unknown`
+- handles `rate_limit`, `billing_error`, `server_error`, and `unknown`
 - creates a detached supervisor only when neither the recorded supervisor nor the child is still alive
 - stores routing/debug metadata including the resolved config dir
 - passes the full parent environment to the supervisor
@@ -133,13 +133,13 @@ Bound today:
 | --- | --- | --- |
 | `rate_limit` | `✓` | Primary intended case |
 | `authentication_failed` | `✗` | Explicitly out of scope |
-| `billing_error` | `✗` | Explicitly out of scope |
+| `billing_error` | `✓` | Treated as retryable by the plugin |
 | `invalid_request` | `✗` | Explicitly out of scope |
 | `server_error` | `✓` | Retryable infrastructure/server-side failure |
 | `max_output_tokens` | `✗` | Explicitly out of scope |
 | `unknown` | `✓` | Catch-all retryable bucket used by the plugin |
 
-Total bound count: `3 / 7`.
+Total bound count: `4 / 7`.
 
 The full `StopFailure.error` enum comes from the Claude Code hooks reference. `neverstop` only starts a background lease for the three checked rows above.
 

@@ -9,10 +9,15 @@ import { withWorkspaceLock } from "./lib/lock.mjs";
 import { computeRetryWindowMs } from "./lib/policy.mjs";
 import { computeRetryDelayMs } from "./lib/policy.mjs";
 import { captureProcessRef, leaseHasLiveProcesses, spawnDetached } from "./lib/process.mjs";
+import { loadRetryPrompt, resolveRetryPromptPath } from "./lib/retry-prompt.mjs";
 import { findActiveLeaseContext, loadState, newLease, resolveLeaseLogFile, saveState, touchLease, writeLeaseSnapshot } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
-const RETRYABLE_ERRORS = new Set(["rate_limit", "server_error", "unknown"]);
+const RETRYABLE_ERRORS = new Set(["rate_limit", "billing_error", "server_error", "unknown"]);
+
+function trace(message) {
+  process.stderr.write(`neverstop: ${message}\n`);
+}
 
 function readInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -43,6 +48,8 @@ function startSupervisor({ cwd, root, leaseId, env, logFile }) {
 async function main() {
   const input = readInput();
   const root = pluginRoot();
+  const retryPrompt = loadRetryPrompt(root);
+  const retryPromptPath = resolveRetryPromptPath(root);
   const inheritedEnv = inheritParentEnv(process.env, {
     NEVERSTOP_PLUGIN_ROOT: root
   });
@@ -52,6 +59,7 @@ async function main() {
     if (!leaseId || !input.error) {
       return;
     }
+    trace(`background child observed StopFailure(error=${input.error}) for lease ${leaseId}`);
     const cwd = resolveWorkspaceRoot(input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd());
     const context = findActiveLeaseContext(cwd, { leaseId });
     const configDir = context?.config_dir ?? summarizeClaudeEnv(process.env, cwd).config_dir;
@@ -91,6 +99,9 @@ async function main() {
   }
 
   if (!RETRYABLE_ERRORS.has(input.error)) {
+    if (input.error) {
+      trace(`ignored StopFailure(error=${input.error}) because it is not bound for background respawn`);
+    }
     return;
   }
 
@@ -102,6 +113,7 @@ async function main() {
     const currentConfigDir = currentContext?.config_dir ?? envSummary.config_dir;
     const state = loadState(cwd, currentConfigDir);
     if (leaseHasLiveProcesses(state.active_lease) || leaseHasLiveProcesses(currentContext?.state?.active_lease)) {
+      trace(`saw StopFailure(error=${input.error}) but an active neverstop lease already owns this workspace`);
       return;
     }
 
@@ -132,6 +144,9 @@ async function main() {
       ...state,
       active_lease: lease
     }, envSummary.config_dir);
+    trace(`retry prompt source: ${retryPromptPath}`);
+    trace(`retry prompt will execute: ${JSON.stringify(retryPrompt)}`);
+    trace(`claimed StopFailure(error=${input.error}) and started background respawn for session ${input.session_id}`);
   }, { configDir: envSummary.config_dir });
 }
 

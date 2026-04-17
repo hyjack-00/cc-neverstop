@@ -58,14 +58,14 @@ sequenceDiagram
     participant BC as Background Claude --resume
 
     F->>SF: StopFailure(error)
-    alt error in {rate_limit, server_error, unknown}
+    alt error in {rate_limit, billing_error, server_error, unknown}
         SF->>L: Acquire workspace lock and load state
         SF->>L: Create/update active lease
         SF->>SV: Spawn detached supervisor with inherited env
         SV->>L: Mark phase=starting/running
         SV->>BC: Spawn claude --resume <session_id> -p "continue task"
         Note over BC: Background process is now the only session owner
-    else error in {authentication_failed, billing_error, invalid_request, max_output_tokens}
+    else error in {authentication_failed, invalid_request, max_output_tokens}
         SF-->>F: neverstop ignores event
     end
 

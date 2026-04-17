@@ -12,13 +12,14 @@
 When Claude Code hits a retryable `StopFailure`:
 
 - `rate_limit`
+- `billing_error`
 - `server_error`
 - `unknown`
 
 `neverstop` starts a background supervisor that runs:
 
 ```bash
-claude --resume <session_id> -p "continue task"
+claude --resume <session_id> -p "$(cat prompts/retry-prompt.txt)"
 ```
 
 The resumed background run inherits the full parent environment from the Claude process that triggered the failure.
@@ -53,7 +54,7 @@ Then resume only with the command that `neverstop` prints.
 When a retryable `StopFailure` happens, `neverstop` may:
 
 - spawn a detached background supervisor process
-- run `claude --resume <session_id> -p "continue task"` on your behalf
+- run `claude --resume <session_id> -p "<prompt from prompts/retry-prompt.txt>"` on your behalf
 - block normal foreground prompts for that workspace until the background lease ends or you take over
 - keep retrying in the background for up to 6 hours
 
@@ -113,12 +114,25 @@ Use `/neverstop:takeover` before any manual foreground re-attach. Do not manuall
 
 ## Retry Behavior
 
-- retryable errors: `rate_limit`, `server_error`, `unknown`
+- retryable errors: `rate_limit`, `billing_error`, `server_error`, `unknown`
 - first retry: immediate
 - later retries: exponential backoff up to a 30 minute cap
 - total retry window: 6 hours
 
 If the lease is in `retry_waiting`, foreground prompts are still blocked because the background path still owns the workspace.
+
+## Retry Prompt
+
+The background retry prompt is editable in:
+
+[`prompts/retry-prompt.txt`](/workspace/skills/cc-neverstop/prompts/retry-prompt.txt:1)
+
+`neverstop` reads this file every time it spawns a background `claude --resume ... -p ...` attempt.
+
+When `StopFailure` is first claimed, the hook also emits a short trace showing:
+
+- which retry prompt file was used
+- the exact prompt string that is about to be executed
 
 ## StopFailure Coverage
 
@@ -130,13 +144,13 @@ Current coverage:
 | --- | --- | --- |
 | `rate_limit` | `✓` | Start or continue background retry flow |
 | `authentication_failed` | `✗` | Ignored by `neverstop` |
-| `billing_error` | `✗` | Ignored by `neverstop` |
+| `billing_error` | `✓` | Start or continue background retry flow |
 | `invalid_request` | `✗` | Ignored by `neverstop` |
 | `server_error` | `✓` | Start or continue background retry flow |
 | `max_output_tokens` | `✗` | Ignored by `neverstop` |
 | `unknown` | `✓` | Start or continue background retry flow |
 
-So the current bound count is `3 / 7`.
+So the current bound count is `4 / 7`.
 
 These names come from the Claude Code hooks reference for `StopFailure.error`.
 
